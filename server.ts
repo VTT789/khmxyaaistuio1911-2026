@@ -1,0 +1,542 @@
+import express from 'express';
+import type { Request, Response } from 'express';
+import cors from 'cors';
+import path from 'path';
+import fs from 'fs';
+import zlib from 'zlib';
+import crypto from 'crypto';
+import { synthesizeEdgeTtsWithRetry } from './src/edgeTts.ts';
+import dotenv from 'dotenv';
+
+dotenv.config();
+
+const app = express();
+app.use(cors());
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
+
+const ROOT_DIR = process.cwd();
+const DEFAULT_SHEET_ID = '1DDDP-Xjtb5kzTM_3HZxcoxtX4fGUtZJ2ARn1qaj5uMo';
+
+// Cache compressed index.html and pinyin-pro.js in memory for instant delivery
+let cachedIndexMtime = 0;
+let cachedIndexGzip: Buffer | null = null;
+let cachedIndexRaw: Buffer | null = null;
+
+function getIndexBuffers(indexPath: string) {
+  const stat = fs.statSync(indexPath);
+  if (stat.mtimeMs !== cachedIndexMtime || !cachedIndexGzip || !cachedIndexRaw) {
+    cachedIndexRaw = fs.readFileSync(indexPath);
+    cachedIndexGzip = zlib.gzipSync(cachedIndexRaw, { level: 6 });
+    cachedIndexMtime = stat.mtimeMs;
+  }
+  return { raw: cachedIndexRaw, gzip: cachedIndexGzip };
+}
+
+let cachedPinyinRaw: Buffer | null = null;
+let cachedPinyinGzip: Buffer | null = null;
+function getPinyinBuffers() {
+  if (!cachedPinyinRaw || !cachedPinyinGzip) {
+    const pPath = path.join(ROOT_DIR, 'static/pinyin-pro.js');
+    cachedPinyinRaw = fs.readFileSync(pPath);
+    cachedPinyinGzip = zlib.gzipSync(cachedPinyinRaw, { level: 6 });
+  }
+  return { raw: cachedPinyinRaw, gzip: cachedPinyinGzip };
+}
+
+const FALLBACK_VOICES = [
+  'zh-CN-XiaoxiaoNeural',
+  'zh-CN-XiaoyiNeural',
+  'zh-CN-liaoning-XiaobeiNeural',
+  'zh-CN-shaanxi-XiaoniNeural',
+  'zh-CN-YunjianNeural',
+  'zh-CN-YunxiNeural',
+  'zh-CN-YunxiaNeural',
+  'zh-CN-YunyangNeural',
+  'zh-HK-HiuGaaiNeural',
+  'zh-HK-HiuMaanNeural',
+  'zh-HK-WanLungNeural',
+  'zh-TW-HsiaoChenNeural',
+  'zh-TW-HsiaoYuNeural',
+  'zh-TW-YunJheNeural',
+  'km-KH-SreymomNeural',
+  'km-KH-PisethNeural',
+];
+
+// Serve gzipped pinyin-pro.js with long-lived immutable caching
+app.get('/static/pinyin-pro.js', (req: Request, res: Response) => {
+  try {
+    const { raw, gzip } = getPinyinBuffers();
+    res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+    res.setHeader('Cache-Control', 'public, max-age=604800, immutable');
+    res.setHeader('Vary', 'Accept-Encoding');
+    const acceptEncoding = String(req.headers['accept-encoding'] || '');
+    if (acceptEncoding.includes('gzip')) {
+      res.setHeader('Content-Encoding', 'gzip');
+      res.setHeader('Content-Length', String(gzip.length));
+      return res.send(gzip);
+    }
+    res.setHeader('Content-Length', String(raw.length));
+    return res.send(raw);
+  } catch {
+    return res.status(404).end();
+  }
+});
+
+// Serve config.js with no-cache so sheet ID updates take effect immediately
+app.get('/static/config.js', (_req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.sendFile(path.join(ROOT_DIR, 'static/config.js'));
+});
+
+// Serve static assets with strong caching for large fonts and images
+app.get(
+  '/static/Fonts/Chinese/Founder%20Bold%20Round%20Simplified.woff2',
+  (_req: Request, res: Response) => {
+    res.setHeader('Cache-Control', 'public, max-age=604800, immutable');
+    res.sendFile(
+      path.join(
+        ROOT_DIR,
+        'static/Fonts/Chinese/Founder Bold Round Simplified, Hanyi Amber Simplified.woff2'
+      )
+    );
+  }
+);
+app.use(
+  '/static/Fonts',
+  express.static(path.join(ROOT_DIR, 'static/Fonts'), {
+    maxAge: '7d',
+    immutable: true,
+  })
+);
+app.use(
+  '/static',
+  express.static(path.join(ROOT_DIR, 'static'), {
+    maxAge: '7d',
+    immutable: true,
+  })
+);
+if (fs.existsSync(path.join(ROOT_DIR, 'public'))) {
+  app.use(express.static(path.join(ROOT_DIR, 'public')));
+}
+
+function formatRate(rate: unknown): string {
+  if (rate === undefined || rate === null || rate === '') {
+    return '+0%';
+  }
+  const clean = String(rate).replace(/%/g, '').trim();
+  if (!clean || clean === '0' || clean === '+0' || clean === '-0') {
+    return '+0%';
+  }
+  const num = parseFloat(clean);
+  if (isNaN(num) || num === 0) {
+    return '+0%';
+  }
+  return num > 0 ? `+${num}%` : `${num}%`;
+}
+
+function escapeXml(unsafe: string): string {
+  return unsafe
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+function getVoiceLocale(voice: string): string {
+  const match = voice.match(/^[a-z]{2,}-[A-Za-z]{2}/);
+  if (match) return match[0];
+  const lower = voice.toLowerCase();
+  if (lower.startsWith('km')) return 'km-KH';
+  if (lower.startsWith('zh-hk')) return 'zh-HK';
+  if (lower.startsWith('zh-tw')) return 'zh-TW';
+  return 'zh-CN';
+}
+
+const ttsAudioCache = new Map<string, Buffer>();
+const MAX_TTS_CACHE_ENTRIES = 1000;
+
+async function synthesizeFallbackTtsBuffer(
+  text: string,
+  voice: string
+): Promise<Buffer> {
+  const lowerVoice = voice.toLowerCase();
+  const tl = lowerVoice.startsWith('km')
+    ? 'km'
+    : lowerVoice.startsWith('zh-hk')
+    ? 'zh-HK'
+    : lowerVoice.startsWith('zh-tw')
+    ? 'zh-TW'
+    : 'zh-CN';
+
+  // Strategy 1: Google Translate GTX endpoint (highly reliable)
+  try {
+    const url = `https://translate.googleapis.com/translate_tts?ie=UTF-8&client=gtx&tl=${encodeURIComponent(
+      tl
+    )}&q=${encodeURIComponent(text)}`;
+    const resp = await fetch(url, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        Referer: 'https://translate.google.com/',
+      },
+    });
+    if (resp.ok) {
+      const arrayBuf = await resp.arrayBuffer();
+      if (arrayBuf.byteLength > 100) {
+        return Buffer.from(arrayBuf);
+      }
+    }
+  } catch (err) {
+    console.warn('Fallback TTS Strategy 1 error:', err);
+  }
+
+  // Strategy 2: Google Translate TW-OB endpoint
+  try {
+    const url = `https://translate.googleapis.com/translate_tts?ie=UTF-8&client=tw-ob&tl=${encodeURIComponent(
+      tl
+    )}&q=${encodeURIComponent(text)}`;
+    const resp = await fetch(url, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      },
+    });
+    if (resp.ok) {
+      const arrayBuf = await resp.arrayBuffer();
+      if (arrayBuf.byteLength > 100) {
+        return Buffer.from(arrayBuf);
+      }
+    }
+  } catch (err) {
+    console.warn('Fallback TTS Strategy 2 error:', err);
+  }
+
+  throw new Error(`Fallback TTS failed for text: ${text.slice(0, 30)}`);
+}
+
+// Home route (with in-memory gzip compression for instant HTML load)
+app.get('/', (req: Request, res: Response) => {
+  const indexPath = path.join(ROOT_DIR, 'index.html');
+  try {
+    const { raw, gzip } = getIndexBuffers(indexPath);
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Vary', 'Accept-Encoding');
+    const acceptEncoding = String(req.headers['accept-encoding'] || '');
+    if (acceptEncoding.includes('gzip')) {
+      res.setHeader('Content-Encoding', 'gzip');
+      res.setHeader('Content-Length', String(gzip.length));
+      return res.send(gzip);
+    }
+    res.setHeader('Content-Length', String(raw.length));
+    return res.send(raw);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return res.status(500).send(`index.html error: ${msg}`);
+  }
+});
+
+// Shared vocabulary fetch logic for /get_vocab and /api/sheet-data
+async function handleGetVocab(req: Request, res: Response) {
+  const customId = typeof req.query.id === 'string' ? req.query.id.trim() : '';
+  const sheetId =
+    customId ||
+    process.env.GOOGLE_SHEETID ||
+    process.env.SHEET_ID ||
+    DEFAULT_SHEET_ID;
+  const apiKey = process.env.GOOGLE_API_KEY;
+
+  if (!sheetId) {
+    return res.status(500).json({ error: 'GOOGLE_SHEETID not set' });
+  }
+
+  if (apiKey && apiKey.startsWith('AIza')) {
+    const url = `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Sheet1?key=${apiKey}`;
+    try {
+      const resp = await fetch(url);
+      if (resp.ok) {
+        const data = (await resp.json()) as { values?: string[][] };
+        const values = data.values || [];
+        if (values.length > 1) {
+          const headers = values[0];
+          const result = values.slice(1).map((row) => {
+            const padded = [...row];
+            while (padded.length < headers.length) {
+              padded.push('');
+            }
+            const rowDict: Record<string, string> = {};
+            for (let i = 0; i < headers.length; i++) {
+              rowDict[headers[i]] = padded[i];
+            }
+            return rowDict;
+          });
+          return res.json(result);
+        }
+      }
+    } catch (err) {
+      console.warn('Google Sheets API error, falling back:', err);
+    }
+  }
+
+  // Fallback 1: opensheet.elk.sh
+  try {
+    const url = `https://opensheet.elk.sh/${sheetId}/Sheet1`;
+    const resp = await fetch(url);
+    if (resp.ok) {
+      const data = await resp.json();
+      if (Array.isArray(data) && data.length > 0) {
+        return res.json(data);
+      }
+    }
+  } catch (err) {
+    console.warn('opensheet fallback failed:', err);
+  }
+
+  // Fallback 2: Google Visualization CSV export
+  try {
+    const gvizUrl = `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:csv&sheet=Sheet1`;
+    const resp = await fetch(gvizUrl);
+    if (resp.ok) {
+      const csvText = await resp.text();
+      const lines = csvText.split(/\r?\n/).filter((l) => l.trim().length > 0);
+      if (lines.length > 1) {
+        const parseLine = (line: string): string[] => {
+          const cells: string[] = [];
+          let cur = '';
+          let inQuotes = false;
+          for (let i = 0; i < line.length; i++) {
+            const ch = line[i];
+            if (ch === '"') {
+              if (inQuotes && line[i + 1] === '"') {
+                cur += '"';
+                i++;
+              } else {
+                inQuotes = !inQuotes;
+              }
+            } else if (ch === ',' && !inQuotes) {
+              cells.push(cur.trim());
+              cur = '';
+            } else {
+              cur += ch;
+            }
+          }
+          cells.push(cur.trim());
+          return cells;
+        };
+        const headers = parseLine(lines[0]);
+        const result = lines.slice(1).map((line) => {
+          const cells = parseLine(line);
+          const rowDict: Record<string, string> = {};
+          for (let i = 0; i < headers.length; i++) {
+            const h = headers[i];
+            if (h) rowDict[h] = cells[i] || '';
+          }
+          return rowDict;
+        });
+        return res.json(result);
+      }
+    }
+  } catch (err) {
+    console.warn('gviz fallback failed:', err);
+  }
+
+  return res.status(500).json({ error: 'Failed to fetch vocabulary from sheet' });
+}
+
+app.get('/get_vocab', handleGetVocab);
+app.get('/api/sheet-data', handleGetVocab);
+
+function sendAudioBuffer(req: Request, res: Response, audioBuffer: Buffer) {
+  res.setHeader('Content-Type', 'audio/mpeg');
+  res.setHeader('Accept-Ranges', 'bytes');
+  res.setHeader('Cache-Control', 'public, max-age=86400');
+
+  const range = req.headers.range;
+  if (range && typeof range === 'string') {
+    const total = audioBuffer.length;
+    const parts = range.replace(/bytes=/, '').split('-');
+    const partialStart = parts[0];
+    const partialEnd = parts[1];
+
+    const start = parseInt(partialStart, 10);
+    const end = partialEnd ? parseInt(partialEnd, 10) : total - 1;
+    if (isNaN(start) || start >= total || end >= total || start > end) {
+      res.setHeader('Content-Range', `bytes */${total}`);
+      return res.status(416).end();
+    }
+    const chunksize = end - start + 1;
+    res.status(206);
+    res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`);
+    res.setHeader('Content-Length', String(chunksize));
+    return res.end(audioBuffer.subarray(start, end + 1));
+  }
+
+  res.setHeader('Content-Length', String(audioBuffer.length));
+  return res.end(audioBuffer);
+}
+
+// Speak route (GET and POST)
+async function handleSpeak(req: Request, res: Response) {
+  try {
+    const source = req.method === 'POST' ? req.body : req.query;
+    const text = String(source?.text ?? '').trim();
+    const voice =
+      String(source?.voice ?? '').trim() || 'zh-TW-HsiaoChenNeural';
+    const defaultRate = voice.toLowerCase().startsWith('zh') ? '-15%' : '+0%';
+    const rate = String(source?.rate ?? defaultRate).trim();
+
+    if (!text) {
+      return res.status(400).json({ error: 'No text provided' });
+    }
+
+    const formattedRate = formatRate(rate);
+    const cacheKey = `${voice}|${formattedRate}|${text}`;
+    const cached = ttsAudioCache.get(cacheKey);
+    if (cached) {
+      return sendAudioBuffer(req, res, cached);
+    }
+
+    let audioBuffer: Buffer;
+    try {
+      audioBuffer = await synthesizeEdgeTtsWithRetry(
+        text,
+        voice,
+        formattedRate
+      );
+    } catch {
+      audioBuffer = await synthesizeFallbackTtsBuffer(text, voice);
+    }
+
+    if (ttsAudioCache.size >= MAX_TTS_CACHE_ENTRIES) {
+      const oldestKey = ttsAudioCache.keys().next().value;
+      if (oldestKey) {
+        ttsAudioCache.delete(oldestKey);
+      }
+    }
+    ttsAudioCache.set(cacheKey, audioBuffer);
+
+    return sendAudioBuffer(req, res, audioBuffer);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('TTS error:', msg);
+    return res.status(500).json({ error: msg });
+  }
+}
+
+app.get('/speak', handleSpeak);
+app.post('/speak', handleSpeak);
+
+// Health check route
+app.get('/test', (_req: Request, res: Response) => {
+  res.json({ status: 'healthy' });
+});
+
+// Voices route
+app.get('/voices', async (_req: Request, res: Response) => {
+  try {
+    const resp = await fetch(
+      'https://speech.platform.bing.com/consumer/speech/synthesize/readaloud/voices/list?trustedclienttoken=6A5AA1D4EAFF4E9FB37E23D68491D6F4',
+      {
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0',
+        },
+      }
+    );
+    if (!resp.ok) {
+      throw new Error(`Bing voices HTTP ${resp.status}`);
+    }
+    const voices = (await resp.json()) as Array<{ ShortName?: string }>;
+    const shortNames = Array.isArray(voices)
+      ? voices
+          .map((v) => v.ShortName)
+          .filter((name): name is string => Boolean(name))
+      : [];
+
+    const combined = Array.from(new Set([...shortNames, ...FALLBACK_VOICES]));
+    return res.json({
+      count: combined.length,
+      voices: combined,
+    });
+  } catch {
+    return res.json({
+      count: FALLBACK_VOICES.length,
+      voices: FALLBACK_VOICES,
+    });
+  }
+});
+
+// Sheet name route
+app.get('/api/sheet-name', async (req: Request, res: Response) => {
+  const customId = typeof req.query.id === 'string' ? req.query.id.trim() : '';
+  const sheetId =
+    customId ||
+    process.env.GOOGLE_SHEETID ||
+    process.env.SHEET_ID ||
+    DEFAULT_SHEET_ID;
+
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+
+  const apiKey = process.env.GOOGLE_API_KEY;
+  if (apiKey && apiKey.startsWith('AIza')) {
+    try {
+      const apiUrl = `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}?fields=properties.title&key=${apiKey}`;
+      const resp = await fetch(apiUrl);
+      if (resp.ok) {
+        const data = (await resp.json()) as { properties?: { title?: string } };
+        if (data.properties?.title) {
+          const title = data.properties.title.trim();
+          if (title) {
+            return res.json({ result: 'success', fileName: title });
+          }
+        }
+      }
+    } catch (err) {
+      console.warn('Google Sheets API title lookup failed:', err);
+    }
+  }
+
+  try {
+    const url = `https://docs.google.com/spreadsheets/d/${sheetId}/edit`;
+    const resp = await fetch(url, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      },
+    });
+    if (resp.ok) {
+      const html = await resp.text();
+      const match = html.match(/<title>([^<]+)<\/title>/i);
+      if (match && match[1]) {
+        const name = match[1].replace(/ - Google.*$/i, '').trim();
+        if (name && !name.toLowerCase().includes('google drive') && !name.toLowerCase().includes('error')) {
+          return res.json({ result: 'success', fileName: name });
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('Failed to fetch sheet name from edit page:', err);
+  }
+
+  // Fallback for default sheet if network to Google is down
+  if (sheetId === DEFAULT_SHEET_ID) {
+    return res.json({
+      result: 'success',
+      fileName: 'វាក្យស័ព្ទទាំងអស់ នៅមិនទាន់ត្រឹមត្រូវឡើយ( សម្រាប់ ការសាកល្បងទាញយក តារាងវាក្យស័ព្ទ ប៉ុណ្ណោះ )',
+    });
+  }
+
+  return res.json({
+    result: 'success',
+    fileName:
+      sheetId.length > 25
+        ? sheetId.substring(0, 12) + '...' + sheetId.substring(sheetId.length - 8)
+        : sheetId,
+  });
+});
+
+const PORT = 3000;
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Vocab Master server running on http://0.0.0.0:${PORT}`);
+});
