@@ -6,6 +6,7 @@ import fs from 'fs';
 import zlib from 'zlib';
 import crypto from 'crypto';
 import { synthesizeEdgeTtsWithRetry } from './src/edgeTts.ts';
+import { synthesizeCustomKhmerTts, KHMER_EXTRA_VOICES } from './src/khmerTts.ts';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -61,6 +62,7 @@ const FALLBACK_VOICES = [
   'zh-TW-YunJheNeural',
   'km-KH-SreymomNeural',
   'km-KH-PisethNeural',
+  ...KHMER_EXTRA_VOICES,
 ];
 
 // Serve gzipped pinyin-pro.js with long-lived immutable caching
@@ -154,7 +156,12 @@ function getVoiceLocale(voice: string): string {
   return 'zh-CN';
 }
 
-const ttsAudioCache = new Map<string, Buffer>();
+interface CachedTtsAudio {
+  buffer: Buffer;
+  contentType: string;
+}
+
+const ttsAudioCache = new Map<string, CachedTtsAudio>();
 const MAX_TTS_CACHE_ENTRIES = 1000;
 
 async function synthesizeFallbackTtsBuffer(
@@ -347,8 +354,13 @@ async function handleGetVocab(req: Request, res: Response) {
 app.get('/get_vocab', handleGetVocab);
 app.get('/api/sheet-data', handleGetVocab);
 
-function sendAudioBuffer(req: Request, res: Response, audioBuffer: Buffer) {
-  res.setHeader('Content-Type', 'audio/mpeg');
+function sendAudioBuffer(
+  req: Request,
+  res: Response,
+  audioBuffer: Buffer,
+  contentType: string = 'audio/mpeg'
+) {
+  res.setHeader('Content-Type', contentType);
   res.setHeader('Accept-Ranges', 'bytes');
   res.setHeader('Cache-Control', 'public, max-age=86400');
 
@@ -394,18 +406,37 @@ async function handleSpeak(req: Request, res: Response) {
     const cacheKey = `${voice}|${formattedRate}|${text}`;
     const cached = ttsAudioCache.get(cacheKey);
     if (cached) {
-      return sendAudioBuffer(req, res, cached);
+      return sendAudioBuffer(req, res, cached.buffer, cached.contentType);
     }
 
     let audioBuffer: Buffer;
-    try {
-      audioBuffer = await synthesizeEdgeTtsWithRetry(
-        text,
-        voice,
-        formattedRate
-      );
-    } catch {
-      audioBuffer = await synthesizeFallbackTtsBuffer(text, voice);
+    let contentType = 'audio/mpeg';
+
+    const customResult = await synthesizeCustomKhmerTts(
+      text,
+      voice,
+      formattedRate
+    ).catch((err) => {
+      console.warn('Custom Khmer TTS failed, falling back:', err instanceof Error ? err.message : err);
+      return null;
+    });
+
+    if (customResult) {
+      audioBuffer = customResult.buffer;
+      contentType = customResult.contentType;
+    } else {
+      const effectiveVoice = KHMER_EXTRA_VOICES.includes(voice as (typeof KHMER_EXTRA_VOICES)[number])
+        ? 'km-KH-SreymomNeural'
+        : voice;
+      try {
+        audioBuffer = await synthesizeEdgeTtsWithRetry(
+          text,
+          effectiveVoice,
+          formattedRate
+        );
+      } catch {
+        audioBuffer = await synthesizeFallbackTtsBuffer(text, effectiveVoice);
+      }
     }
 
     if (ttsAudioCache.size >= MAX_TTS_CACHE_ENTRIES) {
@@ -414,9 +445,9 @@ async function handleSpeak(req: Request, res: Response) {
         ttsAudioCache.delete(oldestKey);
       }
     }
-    ttsAudioCache.set(cacheKey, audioBuffer);
+    ttsAudioCache.set(cacheKey, { buffer: audioBuffer, contentType });
 
-    return sendAudioBuffer(req, res, audioBuffer);
+    return sendAudioBuffer(req, res, audioBuffer, contentType);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('TTS error:', msg);

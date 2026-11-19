@@ -811,7 +811,7 @@
 		}
 				.chinese-main {
 					font-weight: 500;
-					color: #fff;
+					color: #000000;
 					line-height: 1;
 					white-space: nowrap;
 					font-family: 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', system-ui;
@@ -819,6 +819,9 @@
 					transition: text-shadow .1s ease;
 					order: 2
 				}
+		body.night-mode .chinese-main {
+			color: #ffffff;
+		}
 				.chinese-bottom {
 			font-weight: 500;
 			letter-spacing: .3px;
@@ -839,7 +842,7 @@
 			padding: 12px 20px;
 			font-size: 32px;
 			font-weight: 500;
-			color: #fff;
+			color: #000000;
 			white-space: nowrap;
 			font-family: KHLazySmooth, 'Segoe UI', system-ui;
 			transition: none;
@@ -859,6 +862,9 @@
 			-ms-user-select: none !important;
 			user-select: none !important;
 			-webkit-touch-callout: none !important;
+		}
+		body.night-mode .khmer-text {
+			color: #ffffff;
 		}
 				.khmer-text:active {
 					cursor: grabbing
@@ -3048,7 +3054,8 @@
 								</div>
 							</div>
 							<div id=voiceControls class=control-group>
-								<div class=voice-row><label style=font-weight:700>🎙️ Khmer Voice</label><select id=kmVoiceSelect class=voice-select><option value=km-KH-SreymomNeural>Sreymom (Female)</option><option value=km-KH-PisethNeural>Piseth (Male)</option></select></div>
+								<div class=voice-row><label style=font-weight:700>🎙️ Khmer Voice</label><select id=kmVoiceSelect class=voice-select><option value="km-KH-SreymomNeural">Sreymom (Female · Edge TTS)</option><option value="km-KH-PisethNeural">Piseth (Male · Edge TTS)</option><option value="km-KH-MMS-Neural">MMS-TTS (Meta Khmer)</option><option value="km-KH-gTTS">gTTS (Google)</option></select></div>
+								<div class=size-row><label>🎙️ Khmer Speech Rate</label><input type=range id=kmRateSlider class=size-slider min=-100 max=100 value=0 step=5><span id=kmRateVal>0%</span></div>
 								<div class=voice-row><label style=font-weight:700>🇨🇳 Chinese Voice</label>
 									<select id=zhVoiceSelect class=voice-select>
 										<option value="zh-CN-XiaoxiaoNeural">Xiaoxiao ♀</option>
@@ -4252,6 +4259,9 @@
 					const rateSlider = document.getElementById('zhRateSlider');
 					let rate = rateSlider ? parseInt(rateSlider.value) : 0;
 					let rateStr = rate === 0 ? '0%' : (rate > 0 ? '+' + rate + '%' : rate + '%');
+					const kmRateSlider = document.getElementById('kmRateSlider');
+					let kmRate = kmRateSlider ? parseInt(kmRateSlider.value) : 0;
+					let kmRateStr = kmRate === 0 ? '0%' : (kmRate > 0 ? '+' + kmRate + '%' : kmRate + '%');
 					const order = getSpeechOrder();
 
 					const speakZh = async () => {
@@ -4274,7 +4284,7 @@
 							for (let i = 0; i < kmReps; i++) {
 								if (token.cancelled) break;
 								try {
-									await callEdgeTTS(khmer, kmVoice, null);
+									await callEdgeTTS(khmer, kmVoice, kmRateStr);
 								} catch (e) {
 									if (!token.cancelled) console.warn('TTS error:', e);
 								}
@@ -10215,7 +10225,7 @@
 						const params = new URLSearchParams();
 						params.append("text", text);
 						params.append("voice", voice);
-						if (voice && voice.startsWith("zh-") && null !== rate) {
+						if (null !== rate && voice && (voice.startsWith("zh-") || voice.startsWith("km-"))) {
 							params.append("rate", rate);
 						}
 
@@ -10294,7 +10304,8 @@
 
 						// Fallback engine: Unlocked HTML5 audio element
 						const audioEl = typeof getSharedEdgeAudio === "function" ? getSharedEdgeAudio() : new Audio();
-						const blob = new Blob([arrayBuffer], { type: "audio/mpeg" });
+						const mimeType = resp.headers.get("content-type") || "audio/mpeg";
+						const blob = new Blob([arrayBuffer], { type: mimeType });
 						const blobUrl = URL.createObjectURL(blob);
 						audioEl.src = blobUrl;
 
@@ -10408,18 +10419,43 @@
 					enqueueSpeech(e, t, 0 === o ? "0%" : o > 0 ? "+" + o + "%" : o + "%");
 				}
 
+				function getKmRateStr() {
+					const s = document.getElementById("kmRateSlider");
+					const r = s ? (parseInt(s.value) || 0) : 0;
+					return r === 0 ? "0%" : (r > 0 ? "+" + r + "%" : r + "%");
+				}
+
+				function getActiveVocabItemFallback() {
+					if (typeof sidebarIndices !== "undefined" && sidebarIndices.length > 0 &&
+						typeof sidebarFocusIdx !== "undefined" && sidebarFocusIdx >= 0 && sidebarFocusIdx < sidebarIndices.length) {
+						return vocabList[sidebarIndices[sidebarFocusIdx]] || null;
+					}
+					if (typeof normalCurrentIdx !== "undefined" && vocabList[normalCurrentIdx]) {
+						return vocabList[normalCurrentIdx];
+					}
+					return null;
+				}
+
 				function speakKhmerEdge(e) {
 					if (!e) return;
 					if (typeof unlockMobileAudio === "function") unlockMobileAudio();
-					enqueueSpeech(e, document.getElementById("kmVoiceSelect").value, null);
+					enqueueSpeech(e, document.getElementById("kmVoiceSelect").value, getKmRateStr());
 				}
 
 				function speakChineseFromMain() {
 					if (typeof unlockMobileAudio === "function") unlockMobileAudio();
 					const e = document.getElementById("chineseWord");
-					const t = (e && e.getAttribute("data-plain")) || "";
+					let t = ((e && e.getAttribute("data-plain")) || "").trim();
+					if (!t) {
+						const activeItem = getActiveVocabItemFallback();
+						t = activeItem ? (activeItem.chinese || activeItem.khmer || "").trim() : "";
+					}
 					if (!t) return;
 
+					if (autoTimer) {
+						clearTimeout(autoTimer);
+						autoTimer = null;
+					}
 					killAllSpeech();
 					const token = { cancelled: false };
 					_speechCancelToken = token;
@@ -10427,7 +10463,7 @@
 					const reps = Math.max(1, parseInt(document.getElementById("zhReps").value) || 1);
 					const voice = document.getElementById("zhVoiceSelect").value;
 					const rateSlider = document.getElementById("zhRateSlider");
-					let rate = rateSlider ? parseInt(rateSlider.value) : 0;
+					let rate = rateSlider ? (parseInt(rateSlider.value) || 0) : 0;
 					let rateStr = rate === 0 ? "0%" : (rate > 0 ? "+" + rate + "%" : rate + "%");
 
 					(async () => {
@@ -10443,27 +10479,39 @@
 								await new Promise(r => setTimeout(r, 50));
 							}
 						}
+						if (!token.cancelled && autoActive) {
+							startAutoCycle();
+						}
 					})();
 				}
 
 				function speakKhmerFromMain() {
 					if (typeof unlockMobileAudio === "function") unlockMobileAudio();
 					const e = document.getElementById("khmerWord");
-					const t = e ? e.innerText : "";
+					let t = (e ? e.innerText : "").trim();
+					if (!t) {
+						const activeItem = getActiveVocabItemFallback();
+						t = activeItem ? (activeItem.khmer || "").trim() : "";
+					}
 					if (!t) return;
 
+					if (autoTimer) {
+						clearTimeout(autoTimer);
+						autoTimer = null;
+					}
 					killAllSpeech();
 					const token = { cancelled: false };
 					_speechCancelToken = token;
 
 					const reps = Math.max(1, parseInt(document.getElementById("kmReps").value) || 1);
 					const voice = document.getElementById("kmVoiceSelect").value;
+					const rateStr = getKmRateStr();
 
 					(async () => {
 						for (let i = 0; i < reps; i++) {
 							if (token.cancelled) break;
 							try {
-								await callEdgeTTS(t, voice, null);
+								await callEdgeTTS(t, voice, rateStr);
 							} catch (err) {
 								if (!token.cancelled) console.warn("KM TTS error:", err);
 							}
@@ -10471,6 +10519,9 @@
 							if (i < reps - 1) {
 								await new Promise(r => setTimeout(r, 50));
 							}
+						}
+						if (!token.cancelled && autoActive) {
+							startAutoCycle();
 						}
 					})();
 				}
@@ -10784,6 +10835,7 @@
 						.getElementById("repVal").innerText = document.getElementById("zhReps").value, document
 						.getElementById("kmRepVal").innerText = document.getElementById("kmReps").value,
 						document.getElementById("zhRateVal") && document.getElementById("zhRateSlider") && (document.getElementById("zhRateVal").innerText = (parseInt(document.getElementById("zhRateSlider").value) > 0 ? "+" : "") + document.getElementById("zhRateSlider").value + "%"),
+						document.getElementById("kmRateVal") && document.getElementById("kmRateSlider") && (document.getElementById("kmRateVal").innerText = (parseInt(document.getElementById("kmRateSlider").value) > 0 ? "+" : "") + document.getElementById("kmRateSlider").value + "%"),
 						applyChineseMainStyle(), applyPinyinStyles(), applyBottomStyles(), applyShadow(), saveAllData(),
 						forceShrink()
 				}
@@ -10853,6 +10905,7 @@
 				zhVoice: document.getElementById("zhVoiceSelect").value,
 				kmVoice: document.getElementById("kmVoiceSelect").value,
 				zhRate: document.getElementById("zhRateSlider").value,
+				kmRate: document.getElementById("kmRateSlider") ? document.getElementById("kmRateSlider").value : "0",
 				pinyinFont: document.getElementById("pinyinFont").value,
 				pinyinColor: document.getElementById("pinyinColor").value,
 				pinyinBold: document.getElementById("pinyinBold").classList.contains("active"),
@@ -11002,17 +11055,32 @@
 							zhSelect.value = "zh-TW-HsiaoChenNeural";
 						}
 					}
-					if (t.kmVoice) document.getElementById("kmVoiceSelect").value = t.kmVoice;
+					const kmSelect = document.getElementById("kmVoiceSelect");
+					if (kmSelect) {
+						let targetKmVoice = t.kmVoice;
+						if (targetKmVoice === "km-KH-MMS-Local") targetKmVoice = "km-KH-MMS-Neural";
+						if (targetKmVoice === "km-KH-gTTS-Slow") targetKmVoice = "km-KH-gTTS";
+						if (targetKmVoice && Array.from(kmSelect.options).some(opt => opt.value === targetKmVoice)) {
+							kmSelect.value = targetKmVoice;
+						} else {
+							kmSelect.value = "km-KH-SreymomNeural";
+						}
+					}
 					const rateVal = void 0 !== t.zhRate ? t.zhRate : -15;
 					document.getElementById("zhRateSlider").value = rateVal;
 					document.getElementById("zhRateVal").innerText = (parseInt(rateVal) > 0 ? "+" : "") + rateVal + "%";
+					const kmRateSlider = document.getElementById("kmRateSlider");
+					const kmRateLabel = document.getElementById("kmRateVal");
+					const kmRateVal = void 0 !== t.kmRate ? t.kmRate : 0;
+					if (kmRateSlider) kmRateSlider.value = kmRateVal;
+					if (kmRateLabel) kmRateLabel.innerText = (parseInt(kmRateVal) > 0 ? "+" : "") + kmRateVal + "%";
 					if (t.pinyinFont) {
 						document.getElementById("pinyinFont").value = (t.pinyinFont === "inherit" || t.pinyinFont === "normal") ? "'Baguette Simplified'" : t.pinyinFont;
 						if (!document.getElementById("pinyinFont").value) document.getElementById("pinyinFont").value = "'Baguette Simplified'";
 					}
 					if (t.pinyinColor) {
-			// Force white if saved value is the old amber default
-			document.getElementById("pinyinColor").value = (t.pinyinColor === "#fbbf24" || t.pinyinColor === "#f59e0b" || t.pinyinColor === "#ffbf00") ? "#ffffff" : t.pinyinColor;
+			const legacyThemeColor = (safeGetItem("vocabMaster_NightMode", "false") === "true") ? "#ffffff" : "#000000";
+			document.getElementById("pinyinColor").value = (t.pinyinColor === "#fbbf24" || t.pinyinColor === "#f59e0b" || t.pinyinColor === "#ffbf00") ? legacyThemeColor : t.pinyinColor;
 		}
 					if (void 0 !== t.pinyinBold) {
 						const e = document.getElementById("pinyinBold");
@@ -11028,8 +11096,8 @@
 						if (!document.getElementById("bottomFont").value) document.getElementById("bottomFont").value = "'SingKhmer'";
 					}
 				   if (t.bottomCharColor) {
-			// Force white if saved value is the old blue default
-			document.getElementById("bottomCharColor").value = (t.bottomCharColor === "#60a5fa" || t.bottomCharColor === "#3b82f6" || t.bottomCharColor === "#0000ff") ? "#ffffff" : t.bottomCharColor;
+			const legacyThemeColor = (safeGetItem("vocabMaster_NightMode", "false") === "true") ? "#ffffff" : "#000000";
+			document.getElementById("bottomCharColor").value = (t.bottomCharColor === "#60a5fa" || t.bottomCharColor === "#3b82f6" || t.bottomCharColor === "#0000ff") ? legacyThemeColor : t.bottomCharColor;
 		}
 					if (void 0 !== t.bottomBold) {
 						const e = document.getElementById("bottomBold");
@@ -11083,6 +11151,8 @@
 			document.getElementById("zhVoiceSelect").value = "zh-CN-YunxiNeural";
 			document.getElementById("zhRateSlider").value = "-15";
 			document.getElementById("zhRateVal").innerText = "-15%";
+			if (document.getElementById("kmRateSlider")) document.getElementById("kmRateSlider").value = "0";
+			if (document.getElementById("kmRateVal")) document.getElementById("kmRateVal").innerText = "0%";
 			sidebarVisible = false;
 			document.getElementById("rightSide").classList.add("hidden");
 			document.getElementById("sidebarToggleBtn").innerText = "SHOW SIDEBAR";
@@ -12479,6 +12549,12 @@
 					e && t && (t.innerText = (parseInt(e.value) > 0 ? "+" : "") + e.value + "%"), saveAllData()
 				}
 
+				function applyKmRateDisplay() {
+					const e = document.getElementById("kmRateSlider"),
+						t = document.getElementById("kmRateVal");
+					e && t && (t.innerText = (parseInt(e.value) > 0 ? "+" : "") + e.value + "%"), saveAllData()
+				}
+
 				function moveSidebarFocus(e) {
 					const validIndices = sidebarIndices.filter(idx => !pendingDeletions.has(idx) && !softDeletedIndices.has(idx));
 					if (!validIndices.length) return;
@@ -13011,6 +13087,10 @@
 							applyRateDisplay();
 							saveAllData();
 							break;
+						case 'kmRateSlider':
+							applyKmRateDisplay();
+							saveAllData();
+							break;
 						case 'pinyinSizePx':
 							applyPinyinStyles();
 							forceShrink();
@@ -13056,11 +13136,11 @@
 						case 'bottomFont': applyBottomStyles(); break;
 						case 'zhVoiceSelect':
 							saveAllData();
-							if (!autoActive) speakChineseFromMain();
+							speakChineseFromMain();
 							break;
 						case 'kmVoiceSelect':
 							saveAllData();
-							if (!autoActive) speakKhmerFromMain();
+							speakKhmerFromMain();
 							break;
 					}
 				});
